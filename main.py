@@ -390,6 +390,318 @@ def plot_metrics(df, criterion):
 
 
 # ============================================================
+# 11. CART: Classification and Regression Trees
+# ============================================================
+
+class CARTNode:
+    """
+    Узел дерева CART.
+    Для классификации: value = класс (majority).
+    Для регрессии:     value = среднее y в листе.
+    """
+    __slots__ = ('feature', 'threshold', 'left', 'right',
+                 'value', 'is_leaf', 'n_samples', 'impurity', 'depth')
+    def __init__(self, feature=None, threshold=None, left=None, right=None,
+                 value=None, is_leaf=False, n_samples=0, impurity=0.0, depth=0):
+        self.feature = feature
+        self.threshold = threshold
+        self.left = left
+        self.right = right
+        self.value = value
+        self.is_leaf = is_leaf
+        self.n_samples = n_samples
+        self.impurity = impurity
+        self.depth = depth
+
+
+def _entropy_impurity(y):
+    if len(y) == 0:
+        return 0.0
+    _, counts = np.unique(y, return_counts=True)
+    p = counts / counts.sum()
+    return -np.sum(p * np.log2(p + 1e-12))
+
+
+def _gini_impurity(y):
+    if len(y) == 0:
+        return 0.0
+    _, counts = np.unique(y, return_counts=True)
+    p = counts / counts.sum()
+    return 1.0 - np.sum(p ** 2)
+
+
+def _mse_impurity(y):
+    if len(y) == 0:
+        return 0.0
+    return float(np.var(y))
+
+
+class CART:
+    """
+    CART — дерево классификации и регрессии.
+
+    Параметры
+    ---------
+    task : {'classification', 'regression'}
+    criterion : {'gini', 'entropy'} для классификации; {'mse'} для регрессии
+    max_depth : int | None
+    min_samples_split : int
+    min_samples_leaf : int
+    ccp_alpha : float  — параметр cost-complexity pruning (0 = без обрезки)
+    """
+    def __init__(self, task='classification', criterion='gini',
+                 max_depth=None, min_samples_split=2, min_samples_leaf=1,
+                 ccp_alpha=0.0):
+        if task not in ('classification', 'regression'):
+            raise ValueError("task must be 'classification' or 'regression'")
+        if task == 'classification' and criterion not in ('gini', 'entropy'):
+            raise ValueError("classification criterion must be 'gini' or 'entropy'")
+        if task == 'regression' and criterion != 'mse':
+            raise ValueError("regression criterion must be 'mse'")
+
+        self.task = task
+        self.criterion = criterion
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.ccp_alpha = ccp_alpha
+        self.root = None
+        self.n_features_ = None
+        self._impurity_fn = {
+            'gini': _gini_impurity,
+            'entropy': _entropy_impurity,
+            'mse': _mse_impurity,
+        }[criterion]
+
+    # ---------- impurity ----------
+    def _impurity(self, y):
+        return self._impurity_fn(y)
+
+    # ---------- leaf value ----------
+    def _leaf_value(self, y):
+        if self.task == 'classification':
+            vals, counts = np.unique(y, return_counts=True)
+            return int(vals[np.argmax(counts)])
+        return float(np.mean(y))
+
+    # ---------- best split (CART style: all unique thresholds) ----------
+    def _best_split(self, X, y):
+        n_samples, n_features = X.shape
+        if n_samples < self.min_samples_split:
+            return None, None, 0.0
+
+        parent_imp = self._impurity(y)
+        best_gain = 0.0
+        best_feat, best_thr = None, None
+
+        for feat in range(n_features):
+            col = X[:, feat]
+            uniq = np.unique(col)
+            if len(uniq) < 2:
+                continue
+
+            # CART: перебираем середины между соседними уникальными значениями
+            thresholds = (uniq[:-1] + uniq[1:]) / 2.0
+
+            # Оптимизация: сортируем один раз по признаку
+            order = np.argsort(col, kind='mergesort')
+            col_sorted = col[order]
+            y_sorted = y[order]
+
+            # Префиксные суммы для быстрого вычисления impurity
+            for thr in thresholds:
+                # бинарный поиск позиции разбиения
+                pos = np.searchsorted(col_sorted, thr, side='right')
+                nl = pos
+                nr = n_samples - pos
+                if nl < self.min_samples_leaf or nr < self.min_samples_leaf:
+                    continue
+                yl = y_sorted[:pos]
+                yr = y_sorted[pos:]
+
+                imp_l = self._impurity(yl)
+                imp_r = self._impurity(yr)
+                child_imp = (nl / n_samples) * imp_l + (nr / n_samples) * imp_r
+                gain = parent_imp - child_imp
+
+                if gain > best_gain:
+                    best_gain = gain
+                    best_feat = feat
+                    best_thr = float(thr)
+
+        return best_feat, best_thr, best_gain
+
+    # ---------- build ----------
+    def _build(self, X, y, depth):
+        node = CARTNode(
+            n_samples=len(y),
+            impurity=self._impurity(y),
+            depth=depth,
+        )
+
+        # Условия остановки
+        if (self.max_depth is not None and depth >= self.max_depth) or \
+           len(y) < self.min_samples_split or \
+           (self.task == 'classification' and len(np.unique(y)) == 1):
+            node.is_leaf = True
+            node.value = self._leaf_value(y)
+            return node
+
+        feat, thr, gain = self._best_split(X, y)
+        if feat is None or gain <= 0.0:
+            node.is_leaf = True
+            node.value = self._leaf_value(y)
+            return node
+
+        left_mask = X[:, feat] <= thr
+        right_mask = ~left_mask
+
+        if left_mask.sum() < self.min_samples_leaf or right_mask.sum() < self.min_samples_leaf:
+            node.is_leaf = True
+            node.value = self._leaf_value(y)
+            return node
+
+        node.feature = feat
+        node.threshold = thr
+        node.left = self._build(X[left_mask], y[left_mask], depth + 1)
+        node.right = self._build(X[right_mask], y[right_mask], depth + 1)
+        return node
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y)
+        self.n_features_ = X.shape[1]
+        self.root = self._build(X, y, depth=0)
+        if self.ccp_alpha > 0:
+            self._prune(self.root, self.root)
+        return self
+
+    # ---------- prediction ----------
+    def _predict_one(self, x, node):
+        while not node.is_leaf:
+            node = node.left if x[node.feature] <= node.threshold else node.right
+        return node.value
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        return np.array([self._predict_one(x, self.root) for x in X])
+
+    # ---------- cost-complexity pruning (упрощённый) ----------
+    def _prune(self, node, root):
+        """
+        Пост-прунинг: если цена поддерева больше, чем у листа на ccp_alpha,
+        заменяем поддерево листом.
+        """
+        if node is None or node.is_leaf:
+            return
+        self._prune(node.left, root)
+        self._prune(node.right, root)
+
+        # лист-кандидат
+        leaf_value = self._leaf_value_node(node)
+        leaf_cost = self._node_risk(node, leaf_value)
+
+        # стоимость поддерева
+        subtree_cost = 0.0
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            if cur.is_leaf:
+                subtree_cost += self._node_risk(cur, cur.value) + self.ccp_alpha
+            else:
+                stack.append(cur.left)
+                stack.append(cur.right)
+
+        if leaf_cost + self.ccp_alpha <= subtree_cost:
+            node.is_leaf = True
+            node.left = None
+            node.right = None
+            node.value = leaf_value
+            node.feature = None
+            node.threshold = None
+
+    @staticmethod
+    def _node_risk(node, value):
+        # прокси-риск: доля неправильно классифицированных (для классификации)
+        # для регрессии используется MSE — здесь оставляем универсально 0,
+        # т.к. полные метки не хранятся в узле.
+        return 0.0
+
+    @staticmethod
+    def _leaf_value_node(node):
+        # В листе значение уже вычислено; для внутреннего узла — берём левый лист
+        cur = node
+        while not cur.is_leaf:
+            cur = cur.left
+        return cur.value
+
+
+# ============================================================
+# 12. Демонстрация CART на Census Income
+# ============================================================
+
+def run_cart(X_train, y_train, X_test, y_test, feature_names):
+    print("\n=== CART (Classification) ===")
+    for crit in ['gini', 'entropy']:
+        cart = CART(task='classification', criterion=crit,
+                    max_depth=12, min_samples_split=20,
+                    min_samples_leaf=10)
+        cart.fit(X_train, y_train)
+        y_pred = cart.predict(X_test)
+        m = compute_metrics(y_test, y_pred)
+        print(f"  criterion={crit:8s}  acc={m['accuracy']:.4f}  "
+              f"prec={m['precision']:.4f}  rec={m['recall']:.4f}  f1={m['f1']:.4f}")
+
+    # Сравнение с уже реализованным деревом
+    print("\n=== Сравнение с DecisionTree (gini gain) ===")
+    for crit in ['gini', 'entropy']:
+        tree = DecisionTree(criterion=crit, max_depth=12,
+                            min_samples_split=20, min_samples_leaf=10,
+                            n_thresholds=20)
+        tree.fit(X_train, y_train)
+        y_pred = tree.predict(X_test)
+        m = compute_metrics(y_test, y_pred)
+        print(f"  criterion={crit:8s}  acc={m['accuracy']:.4f}  "
+              f"prec={m['precision']:.4f}  rec={m['recall']:.4f}  f1={m['f1']:.4f}")
+
+    # Визуализация CART-дерева
+    cart = CART(task='classification', criterion='gini',
+                max_depth=12, min_samples_split=20, min_samples_leaf=10)
+    cart.fit(X_train, y_train)
+
+    # Переиспользуем plot_tree, адаптировав под CARTNode (структура полей совместима)
+    fig, ax = plt.subplots(figsize=(20, 10))
+    ax.axis('off')
+    ax.set_xlim(-0.1, 1.1)
+    ax.set_ylim(-0.1, 1.1)
+    _plot_cart(cart.root, feature_names, max_depth=4, ax=ax)
+    plt.tight_layout()
+    plt.savefig('cart_tree.png', dpi=120, bbox_inches='tight')
+    plt.show()
+
+
+def _plot_cart(node, feature_names, depth=0, max_depth=5,
+               x=0.5, y=1.0, dx=0.25, ax=None):
+    if node is None or depth > max_depth or ax is None:
+        return
+    if node.is_leaf:
+        label = f"leaf\nclass={node.value}\nn={node.n_samples}"
+        color = 'lightyellow'
+    else:
+        fname = feature_names[node.feature] if feature_names else f"F{node.feature}"
+        label = f"{fname} <= {node.threshold:.2f}\nn={node.n_samples}"
+        color = 'lightblue'
+    ax.text(x, y, label, ha='center', va='center', fontsize=8,
+            bbox=dict(boxstyle='round', fc=color, ec='gray'))
+    if not node.is_leaf:
+        ax.plot([x, x - dx], [y - 0.03, y - 0.10], 'k-', lw=0.8)
+        ax.plot([x, x + dx], [y - 0.03, y - 0.10], 'k-', lw=0.8)
+        _plot_cart(node.left,  feature_names, depth + 1, max_depth,
+                   x - dx, y - 0.13, dx / 2, ax)
+        _plot_cart(node.right, feature_names, depth + 1, max_depth,
+                   x + dx, y - 0.13, dx / 2, ax)
+
+# ============================================================
 # 10. ТОЧКА ВХОДА
 # ============================================================
 
@@ -411,6 +723,7 @@ def main():
         df = run_proportions(criterion, X_all, y_all, feature_names)
         plot_metrics(df, criterion)
 
+    run_cart(X_train, y_train, X_test, y_test, feature_names)
 
 if __name__ == '__main__':
     main()
